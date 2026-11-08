@@ -15,17 +15,47 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 
-/** 鼠标类工具：只有「管理员」权限档允许调用。 */
-const MOUSE_TOOLS = new Set([
-  'cua_driver_native__click',
-  'cua_driver_native__double_click',
-  'cua_driver_native__right_click',
-  'cua_driver_native__drag',
-  'cua_driver_native__scroll',
-  'cua_driver_native__move_cursor',
-  'cua_driver_native__browser_click',
-  'cua_driver_native__browser_pointer',
+/** ★ 2026-11-04 维护：cua driver 0.28 暴露 56 个工具，旧实现只白名单 8 个鼠标名，
+ *  type_text / hotkey / press_key / set_value / clipboard_write / launch_app / kill_app /
+ *  set_window_frame / invoke_menu 等「真能改变你桌面」的动作全部漏掉。
+ *  改为：除只读探测类之外，`cua_driver_native__*` 一律要「管理员」档。
+ *  这样以后 cua 再新增工具，默认也是被拦住的（默认拒绝，而不是默认放行）。 */
+const CUA_PREFIX = 'cua_driver_native__'
+
+/** 只读 / 无害：列窗口、读状态、截图、读无障碍树、会话句柄本身，不改变桌面。 */
+const CUA_READONLY = new Set([
+  'list_apps',
+  'list_windows',
+  'get_window_state',
+  'verify_state',
+  'debug_window_info',
+  'get_screen_size',
+  'get_desktop_state',
+  'get_cursor_position',
+  'get_agent_cursor_state',
+  'check_permissions',
+  'health_report',
+  'get_config',
+  'get_accessibility_tree',
+  'zoom',
+  'page',
+  'get_browser_state',
+  'get_recording_state',
+  'clipboard_read',
+  // 会话句柄：只拿到/查看会话，不动用户屏幕。截图前必须先 start_session，因此不能拦。
+  'start_session',
+  'get_session',
+  'list_sessions',
+  'get_session_state',
+  'end_session',
 ])
+
+const isCuaTool = (name) =>
+  typeof name === 'string' && name.startsWith(CUA_PREFIX)
+
+/** 需要「管理员」档的电脑操作：cua 工具里除去只读探测类的全部。 */
+const isGatedTool = (name) =>
+  isCuaTool(name) && !CUA_READONLY.has(name.slice(CUA_PREFIX.length))
 
 /** ★ 插件核心规则：自己完成所有操作。
  *  单独抽出来，便于在多个通道里重复注入（任一通道可用即生效）。 */
@@ -34,14 +64,48 @@ const SELF_DONE_RULE =
   '自查 DOM/接口全部自己做；不把操作或测试交给用户，用户只做最后验收。' +
   '没自测通过之前不许说"好了"；插件类改动必须自己触发一次真实操作、自己看到效果才算完成。'
 
-/** 写一份通道诊断，别人机器上出问题时能直接看。 */
+/** 当前 profile 名。
+ *
+ * ★ 2026-11-07：DSH 0.2.2-rc.1 的桌面宿主不再把 DSH_PROFILE 放进自己的进程环境
+ *   （只有它 spawn 出来的 shell 子进程才有），诊断文件名一度变成 ...unknown.<pid>.txt。
+ *   现在优先用宿主 provide 的 profileContext（profile-boot 里 hostCtx.provide('profileContext', …)），
+ *   环境变量只作后备。 */
+let diagCtxProfile = ''
+const pathBasename = (p) => String(p).replace(/[\\/]+$/, '').split(/[\\/]/).pop() || ''
+const rememberProfile = (ctx) => {
+  try {
+    const info = ctx && typeof ctx.get === 'function' ? ctx.get('profileContext') : undefined
+    if (info && typeof info.name === 'string' && info.name.length > 0) {
+      diagCtxProfile = info.name
+    } else if (info && typeof info.dir === 'string' && info.dir.length > 0) {
+      diagCtxProfile = pathBasename(info.dir)
+    }
+  } catch {
+    // profileContext 可能还没就绪：留空，走环境变量后备
+  }
+}
+const diagProfile = () => diagCtxProfile
+
+/** 写一份通道诊断，别人机器上出问题时能直接看。
+ *
+ * ★ 2026-11-04：原来固定写 %TEMP%\dsh_admin_mode_diag.txt，所有 profile、
+ *   所有进程共用一个文件 —— 探针 profile 一启动就把桌面端的诊断覆盖掉，
+ *   事后看文件根本分不清是哪个进程写的。现在文件名带上 profile + pid，
+ *   同时把最新的那份另存为 dsh_admin_mode_diag.txt.latest 供人快速查看。 */
 const writeDiag = (lines) => {
   try {
     const fs = require('node:fs')
     const os = require('node:os')
     const path = require('node:path')
-    const file = path.join(os.tmpdir(), 'dsh_admin_mode_diag.txt')
-    fs.writeFileSync(file, lines.join('\n'))
+    const dir = os.tmpdir()
+    const rawProfile = diagProfile()
+      || process.env.DSH_PROFILE
+      || (process.env.DSH_PROFILE_DIR ? path.basename(process.env.DSH_PROFILE_DIR) : '')
+      || 'unknown'
+    const profile = String(rawProfile).replace(/[^A-Za-z0-9_.-]/g, '_')
+    const body = lines.join('\n')
+    fs.writeFileSync(path.join(dir, 'dsh_admin_mode_diag.' + profile + '.' + process.pid + '.txt'), body)
+    fs.writeFileSync(path.join(dir, 'dsh_admin_mode_diag.txt.latest'), body + '\nprofile=' + profile + '\npid=' + process.pid)
   } catch {
     // ignore
   }
@@ -52,10 +116,17 @@ const mark = (name, ok) => {
   channels.push(name + '=' + (ok ? 'ok' : 'fail'))
   writeDiag(channels)
 }
+/** 带值的诊断：mark() 只能写 ok/fail，工具名和次数必须用这个才留得下来。 */
+const note = (key, value) => {
+  const text = String(value === undefined || value === null ? '' : value)
+  channels.push(key + '=' + text.replace(/[\r\n]+/g, ' ').slice(0, 120))
+  writeDiag(channels)
+}
 
 export function apply(ctx) {
   // ★ 2026-10-21：apply 一进来就先落一行「启动时间戳」，
   //   这样重启后看诊断文件就能立刻判断插件到底有没有被宿主加载。
+  rememberProfile(ctx)
   channels.length = 0
   channels.push('apply@' + new Date().toISOString())
   writeDiag(channels)
@@ -143,39 +214,58 @@ export function apply(ctx) {
     mark('permissionPresets', false)
   }
 
+  // ★ 2026-10-23 修复：本包 `export const inject = []`，apply 期间 ctx.tools 不存在，
+  //   直接 ctx.tools.guard 会抛错并被吞掉（诊断里 mouseGuardRegistered=fail）。
+  //   改为在 tools 服务就绪后再注册。
   try {
-    ctx.tools.guard((exec) => {
-      // ★ 2026-10-21：诊断用 —— 记录 guard 实际被调用过几次、最近一次的工具名，
-      //   用来确认「MCP 类工具（cua_driver_native__*）到底走不走 tools.guard」。
-      guardCalls += 1
-      guardLast = String(exec && exec.name)
-      if (guardCalls === 1 || MOUSE_TOOLS.has(exec.name)) {
-        mark('mouseGuardCalls', guardCalls)
-        mark('mouseGuardLast', guardLast)
-      }
-      if (!MOUSE_TOOLS.has(exec.name)) return undefined
-      if (!permissionPresets) return undefined
-      let preset
+    ctx.inject(['tools'], (toolsCtx) => {
       try {
-        const session = exec.agent?.session
-        preset = session ? permissionPresets.current(session) : undefined
-      } catch {
-        preset = undefined
+        toolsCtx.tools.guard((exec) => {
+          // ★ 2026-10-21 起用于确认「MCP 类工具（cua_driver_native__*）到底走不走 tools.guard」；
+          //   2026-11-04 在 rc.5 真实宿主里实测：走，且生效。
+          //   诊断里出现 `mouseGuardDeny=<工具名> @ <权限档>` 即为真拦截。
+          //   注意：这里不能无条件写盘 —— guard 每次工具调用都会被问一次，
+          //   无条件 note() 等于每个工具调用都同步写一遍文件。只在第一次 / cua 工具时记。
+          guardCalls += 1
+          const name = exec && exec.name
+          guardLast = String(name)
+          if (guardCalls === 1 || isCuaTool(name)) {
+            note('mouseGuardCalls', guardCalls)
+            note('mouseGuardLast', guardLast)
+          }
+          if (!isGatedTool(name)) return undefined
+          if (!permissionPresets) return undefined
+          let preset
+          try {
+            const session = exec.agent?.session
+            preset = session ? permissionPresets.current(session) : undefined
+          } catch {
+            preset = undefined
+          }
+          // 只有「管理员」档（纯 danger-full-access + never）放行电脑操作；
+          // 官方「自动审查（auto）」是独立档，不再等同管理员。
+          if (preset === 'admin') {
+            note('mouseGuardAllow', name + ' @ admin')
+            return undefined
+          }
+          note('mouseGuardDeny', name + ' @ ' + (preset ?? '未知'))
+          return (
+            '电脑操作（鼠标/键盘/剪贴板/窗口/应用控制）仅限「管理员」权限档：' +
+            `当前权限档是「${preset ?? '未知'}」，已拒绝执行 ${name}。` +
+            '请切换到管理员档，或者用不涉及屏幕操作的方式完成任务。'
+          )
+        })
+        mark('mouseGuardRegistered', true)
+      } catch (error) {
+        mark('mouseGuardRegistered', false)
+        mark('mouseGuardErr', String(error && error.message || error).slice(0, 160))
+        console.warn('admin-mode: mouse guard skipped:', String(error))
       }
-      // 只有「管理员」档（纯 danger-full-access + never）放行鼠标；
-      // 官方「自动审查（auto）」是独立档，不再等同管理员。
-      if (preset === 'admin') return undefined
-      mark('mouseGuardDeny', true)
-      return (
-        '鼠标操作仅限「管理员」权限档：' +
-        `当前权限档是「${preset ?? '未知'}」，已拒绝执行 ${exec.name}。` +
-        '请切换到管理员档，或者用不涉及鼠标的方式完成任务。'
-      )
     })
-    mark('mouseGuardRegistered', true)
   } catch (error) {
     mark('mouseGuardRegistered', false)
-    console.warn('admin-mode: mouse guard skipped:', String(error))
+    mark('mouseGuardErr', 'outer:' + String(error && error.message || error).slice(0, 150))
+    console.warn('admin-mode: mouse guard unavailable:', String(error))
   }
 
   // ================================================================ 鼠标状态
@@ -183,12 +273,12 @@ export function apply(ctx) {
   let lastMouseAt = 0
 
   ctx.on('tools/pre-execute', (exec, next) => {
-    if (MOUSE_TOOLS.has(exec.name)) lastMouseAt = Date.now()
+    if (isGatedTool(exec.name)) lastMouseAt = Date.now()
     return next()
   })
 
   ctx.on('tools/result', (exec) => {
-    if (MOUSE_TOOLS.has(exec.name)) lastMouseAt = Date.now()
+    if (isGatedTool(exec.name)) lastMouseAt = Date.now()
   })
 
   try {
@@ -220,7 +310,8 @@ export function apply(ctx) {
                 const pathname = String(req.url || '').split('?')[0]
                 if (pathname === '/admin-mode/selftest' && req.method === 'POST') {
                   // ★ UI 自检上报：客户端加载后探测「聊天框还在不在」，
-                  //   结果落进诊断文件（同 %TEMP%\dsh_admin_mode_diag.txt），
+                  //   结果落进诊断文件（%TEMP%\dsh_admin_mode_diag.<profile>.<pid>.txt，
+                  //   并镜像一份到 %TEMP%\dsh_admin_mode_diag.txt.latest），
                   //   便于交付前确认没有把 composer 搞崩。
                   try {
                     const chunks = []

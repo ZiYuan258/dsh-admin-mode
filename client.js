@@ -10,9 +10,19 @@ window.__ModuleLoader__.load({
     const ADMIN = 'admin';
     const FULL = 'danger-full-access';
 
-    // ★ 交付门槛熔断开关：UI 自检发现宿主聊天框异常时置 true，
-    //   本插件立刻停止渲染自己的控件，把界面还给宿主，绝不把聊天框搞崩。
-    let adminUiDisabled = false;
+    // ★ 2026-10-23：远端目录（catalog）是异步拉的，首帧必然还没到。
+    //   没有它，控件会因为 catalog === null 而整块不渲染。
+    const FALLBACK_OPTIONS = [
+      { value: 'read-only', name: 'read-only' },
+      { value: 'workspace-write', name: 'workspace-write' },
+      { value: FULL, name: 'danger-full-access' },
+      { value: ADMIN, name: '管理员' },
+    ];
+
+    // ★ 2026-10-23 修复：自检熔断只关「视觉装饰」（操控光条），
+    //   绝不再连带关掉权限控件。旧逻辑把「composer 首帧尚未绘制」
+    //   误判成宿主聊天框损坏，永久熔断权限选择器 —— 用户看到的就是「权限选择没了」。
+    let overlayDisabled = false;
     const NS = 'admin.permission';
 
     const zh = {
@@ -143,8 +153,8 @@ window.__ModuleLoader__.load({
 
     function makeControl(ctx) {
       return function AdminPermissionControl(props) {
-        // 自检失败熔断：不再渲染本插件的权限控件
-        if (adminUiDisabled) return null;
+        // ★ 2026-10-23：这里不再有任何「整块不渲染」的早退。
+        //   权限控件是刚需，无论自检、catalog、projection 出什么状况都必须画出来。
         const { locked, select, useProjection, t } = props;
         const selection = useProjection('permissions');
         const [catalog, setCatalog] = useState(null);
@@ -213,15 +223,16 @@ window.__ModuleLoader__.load({
           return () => document.removeEventListener('keydown', onKeyDown);
         }, [warn]);
 
-        if (selection === undefined || catalog === null) return null;
-
         // ★ 2026-10-21 主人要求：auto（自动审查）不要了 —— 菜单里不列它。
         //   若当前会话正处在 auto，按钮上仍能显示它的名字（不会瞎），只是菜单不提供。
         const HIDDEN_PRESETS = ['auto'];
         const isHidden = (option) => HIDDEN_PRESETS.indexOf(option.value) !== -1;
-        const allOptions = catalog.options || [];
+        // ★ 2026-10-23：catalog 没到（或拉取失败）时退回内置档位，不再藏控件。
+        const allOptions = (catalog && Array.isArray(catalog.options) && catalog.options.length > 0)
+          ? catalog.options
+          : FALLBACK_OPTIONS;
         const options = allOptions.filter((option) => !isHidden(option));
-        const currentValue = selection.currentValue;
+        const currentValue = selection ? selection.currentValue : undefined;
         const currentIsAdmin = currentValue === ADMIN;
         const labelOf = (option) => {
           if (!option) return t('custom');
@@ -728,16 +739,9 @@ window.__ModuleLoader__.load({
       // ★ 参考 dsh-qwen-paint 的「思考流动画」写法：不画全屏浮层，
       //   而是在**最后一条消息条目**里挂一段流光文字「正在操控电脑」。
       //   纯前端 DOM，零外部依赖；只在鼠标类工具运行中出现，一停立刻移除。
-      const MOUSE_HUD_TOOLS = new Set([
-        'cua_driver_native__click',
-        'cua_driver_native__double_click',
-        'cua_driver_native__right_click',
-        'cua_driver_native__drag',
-        'cua_driver_native__scroll',
-        'cua_driver_native__move_cursor',
-        'cua_driver_native__browser_click',
-        'cua_driver_native__browser_pointer',
-      ])
+      // ★ 2026-11-04：原来这里有一份 8 个鼠标工具名的白名单，实际上没有任何地方用到
+      //   （操控提示的判据只有 host 的 /admin-mode/hud），已删除以免和 host 侧规则不一致。
+      //   门控规则现在统一在 index.js：除只读探测外，cua_driver_native__* 全部要「管理员」档。
       const SHINE_ID = 'dsh-admin-shine'
       const SHINE_CSS_ID = 'dsh-admin-shine-css'
       let shineSuppressedUntil = 0
@@ -797,6 +801,10 @@ window.__ModuleLoader__.load({
 
       let shineBusy = false
       const shineTick = async () => {
+        if (overlayDisabled) {
+          removeShine()
+          return
+        }
         if (Date.now() < shineSuppressedUntil) {
           removeShine()
           return
@@ -841,7 +849,10 @@ window.__ModuleLoader__.load({
       //   判据：聊天输入区（composer）存在且尺寸正常。一旦探测失败（典型症状就是
       //   "聊天框失效"），立刻撤掉本插件所有视觉层并置熔断开关，把界面还给宿主，
       //   同时把结果 POST 给 host 写进诊断文件，交付前能查。
-      const probeComposer = () => {
+      // ★ 2026-10-23：探测改为多次尝试，只有全部落空才关装饰层；
+      //   且无论结果如何都不再动权限控件。
+      const PROBE_ATTEMPTS = 3;
+      const probeComposer = (attempt) => {
         try {
           const candidates = ['[data-composer-card]', '[role="textbox"]', 'textarea', '[contenteditable="true"]']
           let live = false
@@ -855,12 +866,12 @@ window.__ModuleLoader__.load({
           const ourControl = document.querySelector('.apm-trigger') !== null
           const result = { composer: live, ourControl, at: new Date().toISOString() }
           window.__dshAdminSelfTest = result
-          if (!live) {
-            adminUiDisabled = true
+          if (!live && attempt >= PROBE_ATTEMPTS - 1) {
+            overlayDisabled = true
             removeShine()
             const css = document.getElementById(SHINE_CSS_ID)
             if (css !== null) css.remove()
-            console.error('[admin-mode] composer probe failed; own UI disabled', result)
+            console.error('[admin-mode] composer probe failed; overlay disabled (permission control untouched)', result)
           }
           fetch('/admin-mode/selftest', {
             method: 'POST',
@@ -872,7 +883,7 @@ window.__ModuleLoader__.load({
           return null
         }
       }
-      const probeTimers = [setTimeout(probeComposer, 1500), setTimeout(probeComposer, 4000)]
+      const probeTimers = [1500, 4000, 8000].map((delay, index) => setTimeout(() => probeComposer(index), delay))
       ctx.effect(() => () => {
         for (const timer of probeTimers) clearTimeout(timer)
       }, 'admin-mode: ui self-test')

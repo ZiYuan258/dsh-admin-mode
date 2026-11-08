@@ -1,6 +1,13 @@
+# 维护期间的本地备份，不进版本库
+.maintenance/
+
+# 依赖与构建产物
 node_modules/
-__pycache__/
-*.pyc
+pnpm-lock.yaml
+
+# 系统与编辑器
 .DS_Store
 Thumbs.db
-dist/
+*.log
+.vscode/
+.idea/
